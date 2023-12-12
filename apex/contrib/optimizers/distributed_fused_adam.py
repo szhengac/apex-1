@@ -290,15 +290,15 @@ class DistributedFusedAdam(torch.optim.Optimizer):
         device (torch.device, optional): device for optimizer state
             (default: cuda). Currently only supports GPU with one GPU
             per process.
-        process_group (torch.distributed.ProcessGroup, optional):
+        process_groups (list of torch.distributed.ProcessGroup, optional):
             parallel processes participating in optimizer (default:
             default group in torch.distributed). This group is
             interpreted as a 2D grid with dimensions
             distributed_size x redundant_size.
-        distributed_process_group (torch.distributed.ProcessGroup,
+        distributed_process_groups (list of torch.distributed.ProcessGroup,
             optional): parallel processes to distribute optimizer
             state over (default: same as process_group)
-        redundant_process_group (torch.distributed.ProcessGroup,
+        redundant_process_groups (list of torch.distributed.ProcessGroup,
             optional): parallel processes to replicate optimizer state
             over (default: group only containing calling process)
         average_grad_sync (bool, optional): whether to use average
@@ -310,7 +310,7 @@ class DistributedFusedAdam(torch.optim.Optimizer):
         overlap_param_sync (boolean, optional): whether to overlap
             parameter synchronization with forward pass compute
             (default: False). This is an experimental feature.
-        bucket_cap_mb (float, optional): bucket size in megabytes
+        bucket_cap_mb (float or list of float, optional): bucket size in megabytes
             (default: 100)
         pipeline_size (int, optional): number of buckets to process
             simultaneously in optimizer step (default: 2)
@@ -529,13 +529,13 @@ class DistributedFusedAdam(torch.optim.Optimizer):
         grad_sync_dtype: Optional[torch.dtype] = None,
         param_sync_dtype: Optional[torch.dtype] = None,
         device: Optional[torch.device] = "cuda",
-        process_groups: Optional[List[torch.distributed.ProcessGroup]] = None,
-        distributed_process_groups: Optional[List[torch.distributed.ProcessGroup]] = None,
-        redundant_process_groups: Optional[List[torch.distributed.ProcessGroup]] = None,
+        process_groups: Optional[Iterable[torch.distributed.ProcessGroup]] = None,
+        distributed_process_groups: Optional[Iterable[torch.distributed.ProcessGroup]] = None,
+        redundant_process_groups: Optional[Iterable[torch.distributed.ProcessGroup]] = None,
         average_grad_sync: bool = True,
         overlap_grad_sync: bool = True,
         overlap_param_sync: bool = False,
-        bucket_cap_mb: float = 100.0,
+        bucket_cap_mb: Union[float, Iterable[float]] = 100.0,
         pipeline_size: int = 2,
         contiguous_param_buffer: bool = False,
         contiguous_grad_buffer: bool = False,
@@ -630,6 +630,16 @@ class DistributedFusedAdam(torch.optim.Optimizer):
                 )
         self.process_group_roots: List[int] = [get_global_rank(process_group, 0) for process_group in self.process_groups]
 
+        # Get the unique torch distributed groups for coalescing communication
+        def merge(arr):
+            process_counts = collections.defaultdict(lambda: [])
+            for i, ele in enumerate(arr):
+                process_counts[ele].append(i)
+            return process_counts
+        self.process_groups_to_param_group_ids = merge(self.process_groups)
+        self.distributed_process_groups_to_param_group_ids = merge(self.distributed_process_groups)
+        self.redundant_process_groups_to_param_group_ids = None if self.redundant_process_groups is None else merge(self.redundant_process_groups)
+
         # Use average reduction for grad sync
         self.average_grad_sync: bool = average_grad_sync
         # Copy param grads to bucket as soon as available
@@ -662,8 +672,12 @@ class DistributedFusedAdam(torch.optim.Optimizer):
         # Determine bucket sizes
         dtype_size = torch.finfo(self.grad_sync_dtype).bits // 8
         self.alignment: int = 128 // dtype_size
-        bucket_size = 1024 * 1024 * bucket_cap_mb / dtype_size
-        shard_sizes = [int(bucket_size / distributed_size) for distributed_size in self.distributed_sizes]
+        if not isinstance(bucket_cap_mb, Iterable):
+            bucket_cap_mb = [bucket_cap_mb]
+        bucket_sizes = []
+        for bcm in bucket_cap_mb:
+            bucket_sizes.append(1024 * 1024 * bcm / dtype_size)
+        shard_sizes = [int(bucket_size / distributed_size) for distributed_size, bucket_size in zip(self.distributed_sizes, bucket_sizes)]
         shard_sizes = [_round_to_multiple(shard_size, self.alignment, round_up=False) for shard_size in shard_sizes]
         shard_sizes = [max(shard_size, self.alignment) for shard_size in shard_sizes]
         self.default_shard_sizes: List[int] = shard_sizes
@@ -733,20 +747,20 @@ class DistributedFusedAdam(torch.optim.Optimizer):
 
     def _broadcast_params(self) -> None:
         """Broadcast parameter values from root rank"""
-        for i, param_group in enumerate(self.param_groups):
-            process_group = self.process_groups[i]
-            process_group_root = self.process_group_roots[i]
+        for process_group, param_group_ids in self.process_groups_to_param_group_ids.items():
+            process_group_root = self.process_group_roots[param_group_ids[0]]
             with _coalescing_manager(process_group, self.device, async_ops=True) as cm:
-                for param in param_group["params"]:
-                    _coalescing_manager_append_work(
-                        cm,
-                        torch.distributed.broadcast(
-                            param,
-                            src=process_group_root,
-                            group=process_group,
-                            async_op=True,
-                        ),
-                    )
+                for param_group_id in param_group_ids:
+                    for param in self.param_groups[param_group_id]["params"]:
+                        _coalescing_manager_append_work(
+                            cm,
+                            torch.distributed.broadcast(
+                                param,
+                                src=process_group_root,
+                                group=process_group,
+                                async_op=True,
+                            ),
+                        )
             cm.wait()
 
     def _make_post_backward_hook(
@@ -1676,10 +1690,10 @@ class DistributedFusedAdam(torch.optim.Optimizer):
         # Reduce-scatter over distributed process group
         with torch.cuda.stream(comm_stream):
             handles = []
-            for group_idx, group in enumerate(self.distributed_process_groups):
-                if self.distributed_sizes[group_idx] > 1:
+            for group, param_group_ids in self.distributed_process_groups_to_param_group_ids.items():
+                if self.distributed_sizes[param_group_ids[0]] > 1:
                     with _coalescing_manager(group, self.device, async_ops=True) as cm:
-                        for bucket in filter(lambda x: x.param_group_id == group_idx, buckets):
+                        for bucket in filter(lambda x: x.param_group_id in param_group_ids, buckets):
                             _coalescing_manager_append_work(
                                 cm,
                                 reduce_scatter_tensor(
@@ -1698,10 +1712,10 @@ class DistributedFusedAdam(torch.optim.Optimizer):
         if self.redundant_process_groups is not None:
             with torch.cuda.stream(comm_stream):
                 handles = []
-                for group_idx, group in enumerate(self.redundant_process_groups):
-                    if self.redundant_sizes[group_idx] > 1:
+                for group, param_group_ids in self.redundant_process_groups_to_param_group_ids.items():
+                    if self.redundant_sizes[param_group_ids[0]] > 1:
                         with _coalescing_manager(group, self.device, async_ops=True) as cm:
-                            for bucket in filter(lambda x: x.param_group_id == group_idx, buckets):
+                            for bucket in filter(lambda x: x.param_group_id in param_group_ids, buckets):
                                 _coalescing_manager_append_work(
                                     cm,
                                     torch.distributed.all_reduce(
@@ -1831,10 +1845,10 @@ class DistributedFusedAdam(torch.optim.Optimizer):
         # All-gather over distributed process group
         with torch.cuda.stream(comm_stream):
             handles = []
-            for group_idx, group in enumerate(self.distributed_process_groups):
-                if self.distributed_sizes[group_idx] > 1:
+            for group, param_group_ids in self.distributed_process_groups_to_param_group_ids.items():
+                if self.distributed_sizes[param_group_ids[0]] > 1:
                     with _coalescing_manager(group, self.device, async_ops=True) as cm:
-                        for bucket in filter(lambda x: x.param_group_id == group_idx, buckets):
+                        for bucket in filter(lambda x: x.param_group_id in param_group_ids, buckets):
                             _coalescing_manager_append_work(
                                 cm,
                                 all_gather_into_tensor(
