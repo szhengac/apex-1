@@ -1771,10 +1771,10 @@ class DistributedFusedAdam(torch.optim.Optimizer):
         # are in progress
         if params is None:
             params = []
-            if any(
+            if sum(
                 bucket.status == self.ParameterStatus.SYNCING
                 for bucket in self._params_buckets.values()
-            ):
+            ) > 1:
                 return
             for bucket_id, bucket in self._params_buckets.items():
                 if bucket.status == self.ParameterStatus.SHARDED:
